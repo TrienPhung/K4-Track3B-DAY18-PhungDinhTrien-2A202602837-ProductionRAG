@@ -12,6 +12,8 @@ from dataclasses import dataclass
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import TEST_SET_PATH
 
+NAN = float("nan")
+
 
 @dataclass
 class EvalResult:
@@ -52,26 +54,31 @@ def evaluate_ragas(questions: list[str], answers: list[str],
             # Dùng Gemini làm "giám khảo" cho RAGAS, embedding chạy local (bge-m3, không tốn API)
             from langchain_openai import ChatOpenAI
             from langchain_community.embeddings import HuggingFaceEmbeddings
+            from langchain_core.rate_limiters import InMemoryRateLimiter
             from ragas.run_config import RunConfig
 
+            # ~12 request/phút (0.2 req/s) để nằm dưới giới hạn 15 RPM của free tier
+            limiter = InMemoryRateLimiter(requests_per_second=0.2,
+                                          check_every_n_seconds=0.1,
+                                          max_bucket_size=1)
             eval_kwargs["llm"] = ChatOpenAI(model=LLM_MODEL, api_key=LLM_API_KEY,
-                                            base_url=LLM_BASE_URL, temperature=0)
+                                            base_url=LLM_BASE_URL, temperature=0,
+                                            max_retries=0, rate_limiter=limiter)
             eval_kwargs["embeddings"] = HuggingFaceEmbeddings(
                 model_name=EMBEDDING_MODEL, encode_kwargs={"normalize_embeddings": True})
             answer_relevancy.strictness = 1  # Gemini không hỗ trợ n>1 completions
-            eval_kwargs["run_config"] = RunConfig(max_workers=4, timeout=120, max_retries=6)
+            eval_kwargs["run_config"] = RunConfig(max_workers=2, timeout=300, max_retries=8)
 
         result = evaluate(dataset, metrics=[faithfulness, answer_relevancy,
                                             context_precision, context_recall], **eval_kwargs)
         df = result.to_pandas()
 
         def _f(row, name: str) -> float:
-            v = row.get(name, 0.0)
+            # Giữ NaN (job lỗi) để không kéo điểm trung bình về 0
             try:
-                v = float(v)
+                return float(row.get(name, NAN))
             except (TypeError, ValueError):
-                return 0.0
-            return 0.0 if v != v else v  # NaN -> 0.0
+                return NAN
 
         per_question = [
             EvalResult(
@@ -86,7 +93,11 @@ def evaluate_ragas(questions: list[str], answers: list[str],
         ]
 
         def _avg(name: str) -> float:
-            return sum(getattr(r, name) for r in per_question) / max(len(per_question), 1)
+            vals = [getattr(r, name) for r in per_question if getattr(r, name) == getattr(r, name)]
+            nan_count = len(per_question) - len(vals)
+            if nan_count:
+                print(f"  ⚠️  {name}: {nan_count}/{len(per_question)} câu bị NaN (job lỗi), đã bỏ qua khi tính TB")
+            return sum(vals) / len(vals) if vals else 0.0
 
         return {
             "faithfulness": _avg("faithfulness"),
@@ -96,6 +107,8 @@ def evaluate_ragas(questions: list[str], answers: list[str],
             "per_question": per_question,
         }
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         print(f"  ⚠️  RAGAS evaluation failed: {e}")
         return zeros
 
@@ -112,7 +125,7 @@ def failure_analysis(eval_results: list[EvalResult], bottom_n: int = 10) -> list
 
     scored = []
     for r in eval_results:
-        scores = {m: getattr(r, m) for m in metric_names}
+        scores = {m: (0.0 if getattr(r, m) != getattr(r, m) else getattr(r, m)) for m in metric_names}
         avg = sum(scores.values()) / len(scores)
         worst_metric = min(scores, key=scores.get)
         scored.append((avg, worst_metric, scores[worst_metric], r))

@@ -1,6 +1,8 @@
 """Shared configuration for Lab 18."""
 
 import os
+import threading
+import time
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -8,6 +10,7 @@ load_dotenv()
 # --- API Keys ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+
 
 def _clean_model(name: str) -> str:
     """Chuẩn hóa tên mô hình từ .env: bỏ khoảng trắng/ngoặc kép, viết thường, bỏ tiền tố 'models/'."""
@@ -27,29 +30,49 @@ else:
     LLM_PROVIDER, LLM_API_KEY, LLM_BASE_URL, LLM_MODEL = "", "", None, ""
 
 
+# --- Throttle toàn cục: giãn cách giữa các request để không vượt 15 RPM (free tier) ---
+_last_call = 0.0
+_lock = threading.Lock()
+MIN_INTERVAL = 4.5 if LLM_PROVIDER == "gemini" else 0.0  # ~13 request/phút
+
+
+def _throttle():
+    global _last_call
+    if MIN_INTERVAL <= 0:
+        return
+    with _lock:
+        wait = MIN_INTERVAL - (time.time() - _last_call)
+        if wait > 0:
+            time.sleep(wait)
+        _last_call = time.time()
+
+
 def get_llm_client():
-    """OpenAI client trỏ tới Gemini (endpoint tương thích OpenAI) hoặc OpenAI."""
+    """OpenAI client trỏ tới Gemini (endpoint tương thích OpenAI) hoặc OpenAI.
+    max_retries=0 để mọi lần retry đều đi qua llm_chat (có throttle)."""
     from openai import OpenAI
     if LLM_BASE_URL:
-        return OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
-    return OpenAI(api_key=LLM_API_KEY)
+        return OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL, max_retries=0)
+    return OpenAI(api_key=LLM_API_KEY, max_retries=0)
 
 
 def llm_chat(messages: list[dict], **kwargs):
-    """Gọi chat completion, tự thử lại khi bị giới hạn tốc độ (429) hoặc lỗi server."""
-    import time
+    """Gọi chat completion, có throttle và tự thử lại khi bị giới hạn tốc độ (429) hoặc lỗi server."""
     client = get_llm_client()
     last = None
     for attempt in range(4):
         try:
+            _throttle()
             return client.chat.completions.create(model=LLM_MODEL, messages=messages, **kwargs)
         except Exception as e:
             last = e
-            if getattr(e, "status_code", None) in (429, 500, 503) and attempt < 3:
-                time.sleep(5 * (attempt + 1))
+            code = getattr(e, "status_code", None)
+            if code in (429, 500, 503) and attempt < 3:
+                time.sleep(30 if code == 429 else 5 * (attempt + 1))
                 continue
             raise
     raise last
+
 
 # --- Qdrant ---
 QDRANT_HOST = "localhost"

@@ -4,9 +4,11 @@ Lab 18: Production RAG Pipeline — Main Entry Point
 Chạy toàn bộ pipeline: naive baseline → production → so sánh → report.
 
 Usage:
-    python main.py
+    python main.py                    # bỏ qua baseline nếu đã có report hợp lệ
+    python main.py --force-baseline   # ép chạy lại baseline
 """
 
+import argparse
 import json
 import os
 import sys
@@ -17,20 +19,43 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
+METRICS = ["faithfulness", "answer_relevancy", "context_precision", "context_recall"]
+
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--force-baseline", action="store_true",
+                        help="Chạy lại baseline dù đã có report")
+    args = parser.parse_args()
+
     print("=" * 60)
     print("LAB 18: PRODUCTION RAG PIPELINE")
     print("=" * 60)
     start = time.time()
 
     os.makedirs("reports", exist_ok=True)
+    naive_path = "reports/naive_baseline_report.json"
+    prod_path = "reports/ragas_report.json"
 
-    # Step 1: Basic Baseline
+    # Step 1: Basic Baseline (bỏ qua nếu đã có kết quả hợp lệ)
+    baseline_ok = False
+    if os.path.exists(naive_path) and not args.force_baseline:
+        with open(naive_path, encoding="utf-8") as f:
+            agg = json.load(f).get("aggregate", {})
+        baseline_ok = any(isinstance(v, (int, float)) and v > 0 for v in agg.values())
+
     print("\n📌 STEP 1: Running Basic RAG Baseline...")
     print("-" * 40)
-    from naive_baseline import main as run_baseline
-    run_baseline()
+    if baseline_ok:
+        print("  ✓ Đã có reports/naive_baseline_report.json, bỏ qua "
+              "(dùng --force-baseline để chạy lại).")
+    else:
+        from naive_baseline import main as run_baseline
+        run_baseline()
+        if os.path.exists("naive_baseline_report.json"):
+            os.replace("naive_baseline_report.json", naive_path)
+        print("  ⏳ Nghỉ 60s để quota Gemini hồi lại...")
+        time.sleep(60)
 
     # Step 2: Production Pipeline
     print("\n📌 STEP 2: Running Production Pipeline...")
@@ -44,11 +69,13 @@ def main():
         if os.path.exists(f):
             os.replace(f, f"reports/{f}")
 
+    if not any(prod_results.get(m, 0) > 0 for m in METRICS):
+        print("\n❌ Toàn bộ điểm production = 0: RAGAS đã lỗi (xem dòng "
+              "'RAGAS evaluation failed' phía trên). Đừng dùng report này để nộp.")
+
     # Step 3: Comparison
     print("\n📌 STEP 3: Comparison")
     print("-" * 40)
-    naive_path = "reports/naive_baseline_report.json"
-    prod_path = "reports/ragas_report.json"
 
     if os.path.exists(naive_path) and os.path.exists(prod_path):
         with open(naive_path, encoding="utf-8") as f:
@@ -58,7 +85,7 @@ def main():
 
         print(f"\n{'Metric':<25} {'Basic':>8} {'Production':>12} {'Δ':>8}")
         print("-" * 55)
-        for m in ["faithfulness", "answer_relevancy", "context_precision", "context_recall"]:
+        for m in METRICS:
             n = naive.get("aggregate", {}).get(m, 0)
             p = prod.get("aggregate", {}).get(m, 0)
             d = p - n

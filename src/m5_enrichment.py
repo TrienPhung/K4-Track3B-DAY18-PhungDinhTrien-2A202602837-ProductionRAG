@@ -8,7 +8,7 @@ Làm giàu chunks TRƯỚC khi embed: Summarize, HyQA, Contextual Prepend, Auto 
 Test: pytest tests/test_m5.py
 """
 
-import os, sys
+import os, sys, json, hashlib
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 if hasattr(sys.stderr, "reconfigure"):
@@ -49,6 +49,8 @@ def _llm(system: str, user: str, max_tokens: int, json_mode: bool = False) -> st
                 return content.strip()
         except Exception as e:
             print(f"  ⚠️  LLM call failed: {e}")
+            if "429" in str(e):
+                break  # hết quota: không thử lại bản không-JSON (tránh nhân đôi số call)
     return None
 
 
@@ -91,8 +93,13 @@ def summarize_chunk(text: str) -> str:
     Tạo summary ngắn cho chunk.
     Embed summary thay vì (hoặc cùng với) raw chunk → giảm noise.
     """
-    out = _llm("Tóm tắt đoạn văn sau trong 2-3 câu ngắn gọn bằng tiếng Việt.", text, 150)
-    return out if out else _extractive_summary(text)
+    out = _llm(
+        "Tóm tắt đoạn văn sau bằng tiếng Việt, tối đa 2 câu, ngắn hơn đoạn gốc, "
+        "không thêm thông tin mới.", text, 150)
+    # Nếu LLM trả về dài hơn đoạn gốc thì dùng bản tóm tắt trích đoạn
+    if out and len(out) <= len(text):
+        return out
+    return _extractive_summary(text)
 
 
 # ─── Technique 2: Hypothesis Question-Answer (HyQA) ─────
@@ -145,14 +152,40 @@ def extract_metadata(text: str) -> dict:
     return data if data else dict(_DEFAULT_META)
 
 
-# ─── Combined Single-Call Mode ───────────────────────────
+# ─── Combined Single-Call Mode (có cache) ────────────────
+
+_cache: dict | None = None
+_CACHE_PATH = os.path.join("reports", "enrich_cache.json")
+
+
+def _load_cache() -> dict:
+    global _cache
+    if _cache is None:
+        try:
+            with open(_CACHE_PATH, encoding="utf-8") as f:
+                _cache = json.load(f)
+        except Exception:
+            _cache = {}
+    return _cache
+
+
+def _save_cache():
+    os.makedirs(os.path.dirname(_CACHE_PATH), exist_ok=True)
+    with open(_CACHE_PATH, "w", encoding="utf-8") as f:
+        json.dump(_cache, f, ensure_ascii=False)
 
 
 def _enrich_single_call(text: str, source: str) -> dict:
     """Single LLM call to get summary + questions + context + metadata.
 
     ⚠️ Cost optimization: 1 API call thay vì 4 calls riêng lẻ.
+    Kết quả thành công được cache vào reports/enrich_cache.json để chạy lại không tốn quota.
     """
+    cache = _load_cache()
+    key = hashlib.sha1(f"{source}\n{text}".encode("utf-8")).hexdigest()
+    if key in cache:
+        return cache[key]
+
     system = """Phân tích đoạn văn và trả về JSON:
 {
   "summary": "tóm tắt 2-3 câu",
@@ -162,8 +195,10 @@ def _enrich_single_call(text: str, source: str) -> dict:
 }"""
     data = _parse_json(_llm(system, f"Tài liệu: {source}\n\nĐoạn văn:\n{text}", 400, json_mode=True))
     if data:
+        cache[key] = data
+        _save_cache()
         return data
-    # Fallback không cần API key
+    # Fallback không cần API key (không cache để lần sau thử lại)
     return {
         "summary": _extractive_summary(text),
         "questions": _extractive_questions(text, 3),
